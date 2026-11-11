@@ -16,13 +16,33 @@ import base64
 import json
 from fastapi.testclient import TestClient
 from app.main import app
+from app import main as main_module
 from app.services.pipeline import create_tone_wav
 
 client = TestClient(app)
 
 
-def test_two_participant_voice_and_chat_conversation():
+
+async def fake_process_phrase_text(audio_bytes, mime_type, source_language, target_language):
+    if source_language == "hi":
+        return "\u0928\u092e\u0938\u094d\u0924\u0947", "\u0bb5\u0ba3\u0b95\u0bcd\u0b95\u0bae\u0bcd"
+    return "\u0bb5\u0ba3\u0b95\u0bcd\u0b95\u0bae\u0bcd", "\u0928\u092e\u0938\u094d\u0924\u0947"
+
+
+async def fake_synthesize_speech(text, language):
+    return create_tone_wav(freq=440.0, duration_seconds=0.2, sample_rate=16000), "audio/wav"
+
+
+async def fake_translate_chat_message(text, fallback_source, fallback_target):
+    return "\u0bb5\u0ba3\u0b95\u0bcd\u0b95\u0bae\u0bcd", "hi", "ta"
+
+
+def test_two_participant_voice_and_chat_conversation(monkeypatch):
     """Two participants communicating seamlessly in Hindi and Tamil."""
+    # Keep this integration test deterministic; do not call paid external APIs.
+    monkeypatch.setattr(main_module, "process_phrase_text", fake_process_phrase_text)
+    monkeypatch.setattr(main_module, "synthesize_speech", fake_synthesize_speech)
+    monkeypatch.setattr(main_module, "translate_chat_message", fake_translate_chat_message)
     # 1. Create a room
     room_res = client.post("/api/rooms", json={
         "source_language": "hi",

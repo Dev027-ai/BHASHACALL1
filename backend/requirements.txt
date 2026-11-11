@@ -13,3 +13,5 @@ websockets>=12.0,<16.0
 gnani-vachana
 av>=12,<17
 pytest>=8.0
+
+lara-sdk

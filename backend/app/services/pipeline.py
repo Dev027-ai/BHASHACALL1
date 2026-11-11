@@ -22,7 +22,9 @@ import os
 import re
 import socket
 import struct
+import threading
 import time
+import unicodedata
 import uuid
 import wave
 from typing import Any, AsyncIterator, Callable, Coroutine
@@ -31,6 +33,13 @@ from urllib.parse import urlparse
 import httpx
 
 logger = logging.getLogger("bhashacall.pipeline")
+
+# Lara SDK client is synchronous; reuse one authenticated client and run calls
+# in a worker thread so the FastAPI/WebSocket event loop remains responsive.
+_LARA_TRANSLATOR: Any | None = None
+_LARA_CREDENTIALS: tuple[str, str] | None = None
+_LARA_LOCK = threading.Lock()
+
 
 # ============================================================================
 # 1. LANGUAGE AND VOICE CATALOGUE SPECIFICATION
@@ -100,6 +109,31 @@ STT_LANGUAGE_ENV_VARS: dict[str, str] = {
     'te': 'GNANI_STT_LANGUAGE_TE',
     'mr': 'GNANI_STT_LANGUAGE_MR',
 }
+
+
+def normalize_unicode_text(value: Any) -> str:
+    """Preserve user/STT text as valid UTF-8 and normalize canonically (NFC)."""
+    if value is None:
+        return ''
+    text = str(value)
+    try:
+        # Strict round-trip rejects lone surrogate code points instead of silently
+        # replacing or dropping characters at an API/JSON boundary.
+        text = text.encode('utf-8', errors='strict').decode('utf-8', errors='strict')
+    except UnicodeError as exc:
+        raise ValueError('Transcript contains invalid Unicode; please retry the utterance.') from exc
+    if '\ufffd' in text:
+        raise ValueError('Transcript contains Unicode replacement characters; please retry the utterance.')
+    return unicodedata.normalize('NFC', text)
+
+
+def _looks_like_corrupted_hindi(text: str, source: str) -> bool:
+    """Catch obvious terminal/encoding damage before sending Hindi to translation."""
+    if source != 'hi':
+        return False
+    has_devanagari = any('\u0900' <= ch <= '\u097f' for ch in text)
+    has_letters_or_digits = any(ch.isalnum() for ch in text)
+    return not has_devanagari and not has_letters_or_digits and bool(re.search(r'\?{2,}', text))
 
 
 def _lang(language: str) -> str:
@@ -459,7 +493,7 @@ class GnaniRealtimeSTTSession:
         self.is_connected = False
         if self._read_task:
             self._read_task.cancel()
-            with contextlib.suppress(Exception):
+            with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._read_task
         if self._client:
             with contextlib.suppress(Exception):
@@ -490,7 +524,7 @@ async def synthesize_with_gnani(text: str, language: str) -> tuple[bytes, str]:
     Uses gnani.tts.GnaniTTSRealtimeClient.synthesize_and_collect.
     Returns (wav_bytes, 'audio/wav').
     """
-    clean_text = (text or '').strip()
+    clean_text = normalize_unicode_text(text).strip()
     if not clean_text:
         raise RuntimeError("Text to synthesize is empty.")
 
@@ -549,7 +583,7 @@ async def synthesize_speech(text: str, language: str) -> tuple[bytes, str]:
 
 async def synthesize_speech_stream(text: str, language: str) -> AsyncIterator[bytes]:
     """Yield streaming audio chunks from Gnani Timbre v2.5."""
-    clean_text = (text or '').strip()
+    clean_text = normalize_unicode_text(text).strip()
     if not clean_text:
         return
 
@@ -758,135 +792,137 @@ async def _roman_hinglish_to_devanagari(text: str) -> str:
 
 
 def _lookup_corpus_translation(clean_text: str, source: str, target: str) -> str | None:
-    """Check the built-in conversational corpus for exact or close matches."""
-    # Direct match in dictionary
-    normalized = re.sub(r'[^a-z0-9 ]+', '', clean_text.lower()).strip()
-    if normalized in _CONVERSATIONAL_CORPUS:
-        target_trans = _CONVERSATIONAL_CORPUS[normalized].get(target)
-        if target_trans:
-            return target_trans
+    """Match exact phrases in either the English key or selected source language."""
+    def normalize(value: str) -> str:
+        value = unicodedata.normalize("NFC", value).casefold()
+        return " ".join(re.sub(r"[^\w\s]", "", value, flags=re.UNICODE).split())
 
-    # Match in known hinglish sentences
-    if normalized in _KNOWN_HINGLISH_SENTENCES:
-        en_version = _KNOWN_HINGLISH_SENTENCES[normalized]
-        if target == 'en':
+    normalized = normalize(clean_text)
+    if not normalized:
+        return None
+
+    for phrase, translations in _CONVERSATIONAL_CORPUS.items():
+        english_match = normalize(phrase) == normalized
+        source_match = normalize(translations.get(source, "")) == normalized
+
+        if english_match or source_match:
+            result = translations.get(target)
+            if result:
+                return result
+
+    en_version = _KNOWN_HINGLISH_SENTENCES.get(normalized)
+    if en_version:
+        if target == "en":
             return en_version
-        norm_en = re.sub(r'[^a-z0-9 ]+', '', en_version.lower()).strip()
-        if norm_en in _CONVERSATIONAL_CORPUS:
-            return _CONVERSATIONAL_CORPUS[norm_en].get(target)
-
-    # Search through corpus reverse mappings
-    for entry in _CONVERSATIONAL_CORPUS.values():
-        source_phrase = entry.get(source, '').strip().lower()
-        if source_phrase and (source_phrase in clean_text.lower() or clean_text.lower() in source_phrase):
-            target_phrase = entry.get(target)
-            if target_phrase:
-                return target_phrase
+        return _CONVERSATIONAL_CORPUS.get(normalize(en_version), {}).get(target)
 
     return None
 
 
-async def translate_text(text: str, source_language: str, target_language: str) -> str:
-    """Translate text between any of the 6 languages.
+def _get_lara_translator():
+    """Create/reuse Lara SDK translator from server-side environment secrets."""
+    global _LARA_TRANSLATOR, _LARA_CREDENTIALS
+    access_key_id = os.getenv('LARA_ACCESS_KEY_ID', '').strip()
+    access_key_secret = os.getenv('LARA_ACCESS_KEY_SECRET', '').strip()
+    if not access_key_id or not access_key_secret:
+        raise RuntimeError(
+            'Lara translation is not configured. Add LARA_ACCESS_KEY_ID and '
+            'LARA_ACCESS_KEY_SECRET to the backend environment.'
+        )
 
-    Multi-tier architecture:
-    1. Direct identity if source == target.
-    2. Conversational corpus match (instant & zero network overhead).
-    3. External translation provider (e.g. MyMemory or custom endpoint) if configured & reachable.
-    4. Fallback conversational translator preserving punctuation & meaning.
-    """
-    clean_text = (text or '').strip()
+    credentials_key = (access_key_id, access_key_secret)
+    with _LARA_LOCK:
+        if _LARA_TRANSLATOR is None or _LARA_CREDENTIALS != credentials_key:
+            try:
+                from lara_sdk import Credentials, Translator
+            except ImportError as exc:
+                raise RuntimeError(
+                    'Lara SDK is not installed. Install the backend dependency lara-sdk.'
+                ) from exc
+            credentials = Credentials(
+                access_key_id=access_key_id,
+                access_key_secret=access_key_secret,
+            )
+            _LARA_TRANSLATOR = Translator(credentials)
+            _LARA_CREDENTIALS = credentials_key
+    return _LARA_TRANSLATOR
+
+
+def _translate_with_lara(text: str, source: str, target: str) -> str:
+    """Perform one privacy-preserving Lara translation in a worker thread."""
+    translator = _get_lara_translator()
+    source_locale = SUPPORTED_LANGUAGE_LOCALES[source]
+    target_locale = SUPPORTED_LANGUAGE_LOCALES[target]
+    result = translator.translate(
+        text,
+        source=source_locale,
+        target=target_locale,
+        style='faithful',
+        no_trace=True,
+        timeout_ms=int(os.getenv('LARA_TIMEOUT_MS', '4500')),
+    )
+    translated = getattr(result, 'translation', None)
+    if isinstance(translated, list):
+        translated = ' '.join(str(part) for part in translated)
+    translated = normalize_unicode_text(translated or '').strip()
+    if not translated:
+        raise RuntimeError('Lara returned an empty translation.')
+    if translated.casefold() == text.strip().casefold():
+        # Identity can be legitimate for names, but reject suspicious unchanged
+        # output when source and target are different languages.
+        if source != target and len(text.strip()) > 3:
+            logger.warning('Lara returned unchanged text for %s -> %s', source, target)
+    return translated
+
+
+async def _translate_with_mymemory(text: str, source: str, target: str) -> str:
+    """Optional legacy fallback; disabled unless explicitly enabled."""
+    endpoint = os.getenv('MYMEMORY_API_URL', 'https://api.mymemory.translated.net/get').strip()
+    params = {'q': text, 'langpair': f'{source}|{target}'}
+    email = os.getenv('MYMEMORY_EMAIL', '').strip()
+    if email:
+        params['de'] = email
+    async with httpx.AsyncClient(timeout=httpx.Timeout(5, connect=2)) as client:
+        response = await client.get(endpoint, params=params)
+        response.raise_for_status()
+        data = response.json()
+    translated = str(data.get('responseData', {}).get('translatedText', '')).strip()
+    if not translated or translated.startswith('MYMEMORY WARNING'):
+        raise RuntimeError('MyMemory did not return a valid translation.')
+    return translated
+
+
+async def translate_text(text: str, source_language: str, target_language: str) -> str:
+    """Translate using exact phrase memory, then Lara; no fabricated fallback."""
+    clean_text = normalize_unicode_text(text).strip()
     if not clean_text:
-        raise RuntimeError("Text to translate is empty.")
+        raise RuntimeError('Text to translate is empty.')
 
     source = _lang(source_language)
     target = _lang(target_language)
-
+    if source not in SUPPORTED_LANGUAGE_LOCALES or target not in SUPPORTED_LANGUAGE_LOCALES:
+        raise RuntimeError(f'Unsupported translation pair: {source} -> {target}.')
+    if _looks_like_corrupted_hindi(clean_text, source):
+        raise RuntimeError('Hindi transcript appears corrupted before translation (question-mark placeholders). Check UTF-8 input and retry.')
     if source == target:
         return clean_text
 
-    # Check corpus first for immediate precision
     corpus_match = _lookup_corpus_translation(clean_text, source, target)
     if corpus_match:
         return corpus_match
 
-    # Try external provider if configured
-    endpoint = os.getenv('TRANSLATION_API_URL', 'https://api.mymemory.translated.net/get').strip()
-    api_key = os.getenv('TRANSLATION_API_KEY', '').strip()
-
-    if endpoint and not is_mock_mode():
-        try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(6, connect=3)) as client:
-                if 'mymemory' in endpoint or endpoint.rstrip('/').endswith('/get'):
-                    params = {'q': clean_text, 'langpair': f'{source}|{target}'}
-                    if api_key:
-                        params['key'] = api_key
-                    resp = await client.get(endpoint, params=params)
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        translated = str(data.get('responseData', {}).get('translatedText', '')).strip()
-                        if translated and not translated.startswith('MYMEMORY WARNING'):
-                            return translated
-                else:
-                    body: dict[str, Any] = {'q': clean_text, 'source': source, 'target': target, 'format': 'text'}
-                    if api_key:
-                        body['api_key'] = api_key
-                    resp = await client.post(endpoint, json=body)
-                    if resp.status_code == 200:
-                        translated = str(resp.json().get('translatedText', '')).strip()
-                        if translated:
-                            return translated
-        except Exception as exc:
-            logger.info("External translation provider unavailable (%s). Using fallback translation.", exc)
-
-    # Fallback conversational mapping for remaining phrases
-    return _conversational_fallback_translate(clean_text, source, target)
-
-
-def _conversational_fallback_translate(text: str, source: str, target: str) -> str:
-    """Fallback translator that handles conversational sentences across all 6 languages."""
-    norm = re.sub(r'[^a-zA-Z0-9\u0900-\u0D7F]+', ' ', text).strip().lower()
-
-    # Generic conversational responses per language
-    responses = {
-        'hi': {
-            'greeting': 'नमस्ते, आप कैसे हैं?',
-            'statement': 'मैं समझ गया। अपनी बात जारी रखें।',
-            'question': 'हाँ, कृपया विस्तार से बताएँ।',
-        },
-        'en': {
-            'greeting': 'Hello, how are you?',
-            'statement': 'I understand. Please continue.',
-            'question': 'Yes, please tell me more.',
-        },
-        'bn': {
-            'greeting': 'নমস্কার, আপনি কেমন আছেন?',
-            'statement': 'আমি বুঝতে পেরেছি। চালিয়ে যান।',
-            'question': 'হ্যাঁ, দয়া করে বিস্তারিত বলুন।',
-        },
-        'ta': {
-            'greeting': 'வணக்கம், நீங்கள் எப்படி இருக்கிறீர்கள்?',
-            'statement': 'எனக்கு புரிகிறது. தொடர்ந்து பேசுங்கள்.',
-            'question': 'ஆம், தயவுசெய்து விரிவாகக் கூறுங்கள்.',
-        },
-        'te': {
-            'greeting': 'నమస్కారం, మీరు ఎలా ఉన్నారు?',
-            'statement': 'నాకు అర్థమైంది. దయచేసి కొనసాగించండి.',
-            'question': 'అవును, దయచేసి వివరంగా చెప్పండి.',
-        },
-        'mr': {
-            'greeting': 'नमस्कार, तुम्ही कसे आहात?',
-            'statement': 'मला समजले. कृपया पुढे बोला.',
-            'question': 'होय, कृपया सविस्तर सांगा.',
-        },
-    }
-
-    is_q = '?' in text or any(w in norm for w in ['kya', 'kyu', 'why', 'what', 'how', 'kaisa', 'kaise', 'eppadi', 'ela'])
-    is_g = any(w in norm for w in ['hello', 'hi', 'namaste', 'namaskar', 'vanakkam', 'namaskaram'])
-
-    cat = 'greeting' if is_g else ('question' if is_q else 'statement')
-    target_resp = responses.get(target, responses['en']).get(cat, 'I understand.')
-    return target_resp
+    try:
+        return await asyncio.to_thread(_translate_with_lara, clean_text, source, target)
+    except Exception as lara_error:
+        # MyMemory is an opt-in backup, not the primary translator.
+        if os.getenv('TRANSLATION_FALLBACK', '').strip().lower() == 'mymemory':
+            try:
+                return await _translate_with_mymemory(clean_text, source, target)
+            except Exception as fallback_error:
+                logger.warning('Lara and MyMemory translation failed; error_types=%s,%s', type(lara_error).__name__, type(fallback_error).__name__)
+                raise RuntimeError('Translation unavailable: Lara and MyMemory providers failed.') from fallback_error
+        logger.warning('Lara translation failed; error_type=%s', type(lara_error).__name__)
+        raise RuntimeError('Translation unavailable: Lara provider failed.') from lara_error
 
 
 async def translate_chat_message(
@@ -895,7 +931,7 @@ async def translate_chat_message(
     fallback_target: str = 'hi'
 ) -> tuple[str, str, str]:
     """Translate each chat message, determining direction by script & Hinglish detection."""
-    clean_text = (text or '').strip()
+    clean_text = normalize_unicode_text(text).strip()
     if not clean_text:
         return "", fallback_source, fallback_target
 
