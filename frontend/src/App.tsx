@@ -251,6 +251,13 @@ export default function App() {
         setRoomCode(normalized);
         setStatus('Connected — Gnani STT & TTS ready for voice call');
         setTab('rooms');
+        ws.send(
+          JSON.stringify({
+            type: 'set_languages',
+            source_language: sourceLanguage,
+            target_language: targetLanguage,
+          })
+        );
         loadRoomMessages(normalized);
       };
 
@@ -1187,7 +1194,7 @@ export default function App() {
                     Speak in
                     <select
                       value={sourceLanguage}
-                      disabled={callActive}
+
                       onChange={(e) => {
                         setSourceLanguage(e.target.value);
                         if (wsRef.current?.readyState === WebSocket.OPEN) {
@@ -1212,7 +1219,7 @@ export default function App() {
                     Translate to
                     <select
                       value={targetLanguage}
-                      disabled={callActive}
+
                       onChange={(e) => {
                         setTargetLanguage(e.target.value);
                         if (wsRef.current?.readyState === WebSocket.OPEN) {

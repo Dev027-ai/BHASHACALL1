@@ -2,6 +2,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import logging
 import os
 import re
 import secrets
@@ -9,6 +10,8 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 from dotenv import load_dotenv
 
@@ -31,6 +34,7 @@ from app.services.pipeline import (
     get_stt_locale,
     get_tts_locale,
     SUPPORTED_LANGUAGE_LOCALES,
+    normalize_unicode_text,
     TIMBRE_V25_VOICES,
     DEFAULT_VOICE_MAP,
 )
@@ -206,43 +210,56 @@ async def room_socket(ws: WebSocket, room_code: str, participant_id: str):
 
     async def on_stt_transcript(event_data: dict[str, Any]):
         """Handler for transcript events from Gnani Prisma v3.0 STT."""
-        text = event_data.get('text', '').strip()
+        text = normalize_unicode_text(event_data.get('text', '')).strip()
         if not text:
             return
 
         t_stt_done = time.time()
         phrase_id = str(uuid.uuid4())
-        src_lang = meta.get('source_language', room.get('source_language', 'hi'))
+        # Respect the language selected by the speaker.
+        # Prisma detection is retained as metadata; it must not silently
+        # override the user's selected source language.
+        src_lang = str(
+            meta.get('source_language') or room.get('source_language') or 'hi'
+        ).strip().lower().split('-', 1)[0]
 
-        # Check detected language from Prisma v3.0
+        tgt_lang = str(
+            meta.get('target_language') or room.get('target_language') or 'en'
+        ).strip().lower().split('-', 1)[0]
+
         detected = event_data.get('detected_language_code')
-        if detected:
-            short_detected = detected.split('-')[0]
-            if short_detected in SUPPORTED_LANGUAGE_LOCALES:
-                src_lang = short_detected
 
-        # Find target language from recipient's preferences
-        other_participants = [pid for pid in room['participants'] if pid != participant_id]
-        tgt_lang = meta.get('target_language', room.get('target_language', 'en'))
-        if other_participants:
-            other_meta = room.get('participant_meta', {}).get(other_participants[0], {})
-            tgt_lang = other_meta.get('target_language') or other_meta.get('source_language') or tgt_lang
+        # Each participant selects the language they speak.
+        # Translate this speaker's words into the recipient's spoken language.
+
+        logger.info(
+            "BHASHACALL_TRANSLATION_START participant=%s source=%s target=%s detected=%s",
+            participant_id, src_lang, tgt_lang, detected
+        )
 
         t_trans_start = time.time()
+        translated = ''
+        translation_error = None
         try:
             translated = await translate_text(text, src_lang, tgt_lang)
-        except Exception:
-            translated = text
+        except Exception as exc:
+            translation_error = safe_error(exc)
+        logger.info(
+            "BHASHACALL_TRANSLATION_RESULT source=%s target=%s status=%s",
+            src_lang, tgt_lang, "success" if translated else "failed"
+        )
+
         t_trans_done = time.time()
         trans_ms = int((t_trans_done - t_trans_start) * 1000)
 
-        # Broadcast live captions to both participants
         caption_msg = {
             'type': 'caption.live',
             'from': participant_id,
             'phrase_id': phrase_id,
             'original': text,
             'translated': translated,
+            'translation_status': 'translated' if translated else 'failed',
+            'translation_error': translation_error,
             'source_language': src_lang,
             'target_language': tgt_lang,
             'detected_language': detected or get_stt_locale(src_lang),
@@ -255,8 +272,9 @@ async def room_socket(ws: WebSocket, room_code: str, participant_id: str):
         }
         await broadcast(room, caption_msg)
 
-        # Generate translated speech with Gnani Timbre v2.5 and send to the other participant(s) only
-        asyncio.create_task(send_speech_to_recipients(room, participant_id, phrase_id, translated, tgt_lang, t_stt_done))
+        # Never synthesize or send audio unless a real translation succeeded.
+        if translated:
+            asyncio.create_task(send_speech_to_recipients(room, participant_id, phrase_id, translated, tgt_lang, t_stt_done))
 
     try:
         await ws.send_json({
@@ -269,8 +287,17 @@ async def room_socket(ws: WebSocket, room_code: str, participant_id: str):
             kind = msg.get('type')
 
             if kind == 'set_languages':
-                src = str(msg.get('source_language') or meta['source_language'])
-                tgt = str(msg.get('target_language') or meta['target_language'])
+                src = str(msg.get('source_language') or meta['source_language']).strip().lower().split('-', 1)[0]
+                tgt = str(msg.get('target_language') or meta['target_language']).strip().lower().split('-', 1)[0]
+                if src not in SUPPORTED_LANGUAGE_LOCALES or tgt not in SUPPORTED_LANGUAGE_LOCALES:
+                    await ws.send_json({'type': 'language_error', 'text': 'Choose one of the six supported languages.'})
+                    continue
+                if src != meta.get('source_language'):
+                    old_session = meta.get('stt_session')
+                    meta['stt_generation'] = int(meta.get('stt_generation', 0)) + 1
+                    meta['stt_session'] = None
+                    if old_session:
+                        await old_session.close()
                 meta['source_language'] = src
                 meta['target_language'] = tgt
                 await ws.send_json({'type': 'languages_updated', 'source_language': src, 'target_language': tgt})
@@ -284,9 +311,14 @@ async def room_socket(ws: WebSocket, room_code: str, participant_id: str):
                         session = meta.get('stt_session')
                         if session is None or not session.is_connected:
                             stt_locale = get_stt_locale(meta.get('source_language', 'hi'))
+                            generation = int(meta.get('stt_generation', 0))
+                            async def session_transcript(event_data: dict[str, Any], _generation: int = generation):
+                                if _generation != int(meta.get('stt_generation', 0)):
+                                    return
+                                await on_stt_transcript(event_data)
                             session = GnaniRealtimeSTTSession(
                                 language_code=stt_locale,
-                                on_transcript=on_stt_transcript
+                                on_transcript=session_transcript
                             )
                             await session.start()
                             meta['stt_session'] = session
@@ -315,6 +347,8 @@ async def room_socket(ws: WebSocket, room_code: str, participant_id: str):
                         source,
                         target
                     )
+                    original = normalize_unicode_text(original)
+                    translated = normalize_unicode_text(translated)
                     t_stt_done = time.time()
                     await broadcast(
                         room,
@@ -334,7 +368,7 @@ async def room_socket(ws: WebSocket, room_code: str, participant_id: str):
                     await ws.send_json({
                         'type': 'phrase_status',
                         'phrase_id': phrase_id,
-                        'text': 'Captions delivered. Preparing Gnani translated audio…'
+                        'text': 'Captions delivered. Preparing Gnani translated audio...'
                     })
                     asyncio.create_task(send_speech_to_recipients(room, participant_id, phrase_id, translated, target, t_stt_done))
                 except Exception as exc:
@@ -398,7 +432,7 @@ async def room_socket(ws: WebSocket, room_code: str, participant_id: str):
 
             elif kind == 'caption.text':
                 # Provided for backwards compatibility
-                text = str(msg.get('text', '')).strip()
+                text = normalize_unicode_text(msg.get('text', '')).strip()
                 if not text or len(text) > 1500:
                     continue
                 source = str(msg.get('source_language', 'hi'))
@@ -425,13 +459,13 @@ async def room_socket(ws: WebSocket, room_code: str, participant_id: str):
                     await ws.send_json({'type': 'caption.error', 'text': safe_error(exc)})
 
             elif kind == 'chat.message':
-                text = str(msg.get('text', '')).strip()
+                text = normalize_unicode_text(msg.get('text', '')).strip()
                 client_message_id = str(msg.get('client_message_id') or '')[:80]
                 if not text or len(text) > 20000:
                     await ws.send_json({
                         'type': 'chat.error',
                         'client_message_id': client_message_id,
-                        'text': 'Message must contain 1–20000 characters.'
+                        'text': 'Message must contain 1-20000 characters.'
                     })
                     continue
                 fallback_source = str(msg.get('source_language', meta.get('source_language', 'en')))
@@ -442,7 +476,7 @@ async def room_socket(ws: WebSocket, room_code: str, participant_id: str):
                 try:
                     translated, source, target = await translate_chat_message(text, fallback_source, fallback_target)
                 except Exception as exc:
-                    translated = text
+                    translated = ''
                     translation_error = safe_error(exc)
 
                 message_id = str(uuid.uuid4())
@@ -833,7 +867,7 @@ def room_messages(room_code: str):
 async def translate_standalone_message(payload: TextMessage):
     text = payload.text.strip()
     if not text or len(text) > 20000:
-        raise HTTPException(400, 'Message must contain 1–20000 characters.')
+        raise HTTPException(400, 'Message must contain 1-20000 characters.')
     translated = await translate_text(text, payload.source_language, payload.target_language)
     return {
         'original_text': text,
